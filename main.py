@@ -1,5 +1,4 @@
 import asyncio
-import json
 import queue
 import threading
 import time
@@ -7,9 +6,10 @@ import time
 import numpy as np
 import sounddevice as sd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, VADIterator
 import uvicorn
+
+from whisper_gpu.whisper_gpu import WhisperGPU
 
 
 # ============================================================
@@ -22,16 +22,30 @@ PORT = 6912
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-# Silero VAD wants small chunks.
-VAD_CHUNK_SAMPLES = 512       # 32 ms at 16 kHz
+VAD_CHUNK_SAMPLES = 512
 
-# Silence required before VAD considers speech finished.
 MIN_SILENCE_MS = 600
-
-# Extra audio around speech boundaries.
 SPEECH_PAD_MS = 200
 
-WHISPER_MODEL = "small"
+# ------------------------------------------------------------
+# Rolling transcription
+# ------------------------------------------------------------
+
+# How often an interim transcription is produced.
+INTERIM_INTERVAL = 0.75
+
+# Only the newest portion of the utterance is sent to Whisper
+# for interim recognition.
+INTERIM_WINDOW_SECONDS = 4.0
+
+# Don't attempt an interim until at least this much audio exists.
+INTERIM_MIN_AUDIO_SECONDS = 0.8
+
+# ------------------------------------------------------------
+# Whisper
+# ------------------------------------------------------------
+
+WHISPER_MODEL = "models/ggml-base.bin"
 
 
 # ============================================================
@@ -53,24 +67,11 @@ whisper_lock = threading.Lock()
 # Load models
 # ============================================================
 
-print("Loading Whisper...", flush=True)
+print("Loading Whisper.cpp Vulkan GPU model...", flush=True)
 
-# Slower cpu model - but more compatible
+whisper = WhisperGPU(WHISPER_MODEL)
 
-whisper = WhisperModel(
-    WHISPER_MODEL,
-    device="cpu",
-    compute_type="int8",
-)
-"""
-# Faster gpu model - but it might explode especially on amd
-whisper = WhisperModel(
-    WHISPER_MODEL,
-    device="cuda",
-    compute_type="float16",
-)
-"""
-print("Whisper loaded.", flush=True)
+print("Whisper.cpp GPU model loaded.", flush=True)
 
 
 print("Loading Silero VAD...", flush=True)
@@ -91,13 +92,6 @@ def make_message(
     end,
     text,
 ):
-    # IMPORTANT:
-    # text is deliberately the final field.
-    #
-    # This means text can contain arbitrary '=' or newlines.
-    # The receiver can simply find "text=" and take everything
-    # after it.
-
     return (
         f"type={message_type}\n"
         f"lang={language}\n"
@@ -141,7 +135,6 @@ def microphone_callback(indata, frames, time_info, status):
     if status:
         print(f"\n[AUDIO] {status}", flush=True)
 
-    # Copy because sounddevice reuses its buffer.
     audio = indata[:, 0].copy()
 
     audio_queue.put(audio)
@@ -164,7 +157,10 @@ def microphone_worker():
                 time.sleep(1)
 
     except Exception as e:
-        print(f"\n[MICROPHONE ERROR] {e!r}", flush=True)
+        print(
+            f"\n[MICROPHONE ERROR] {e!r}",
+            flush=True,
+        )
 
 
 # ============================================================
@@ -173,40 +169,19 @@ def microphone_worker():
 
 def transcribe(audio):
     """
-    Run Whisper on a numpy float32 mono array.
+    Transcribe a float32 mono numpy array using whisper.cpp.
     """
 
+    if len(audio) == 0:
+        return ""
+
+    audio = np.asarray(
+        audio,
+        dtype=np.float32,
+    )
+
     with whisper_lock:
-        segments, info = whisper.transcribe(
-            audio,
-            beam_size=1,
-            vad_filter=False,
-            condition_on_previous_text=False,
-        )
-
-        segments = list(segments)
-
-    text_parts = []
-
-    start = None
-    end = None
-
-    for segment in segments:
-        text = segment.text.strip()
-
-        if not text:
-            continue
-
-        text_parts.append(text)
-
-        if start is None:
-            start = segment.start
-
-        end = segment.end
-
-    text = " ".join(text_parts).strip()
-
-    return text, info.language, start, end
+        return whisper.transcribe(audio)
 
 
 # ============================================================
@@ -225,30 +200,43 @@ def speech_worker():
     )
 
     speech_audio = []
+
     speech_active = False
 
     speech_start_time = None
+
+    last_interim_time = 0.0
 
     while True:
         audio = audio_queue.get()
 
         try:
-            tensor = np.asarray(audio, dtype=np.float32)
+            tensor = np.asarray(
+                audio,
+                dtype=np.float32,
+            )
 
             import torch
 
-            tensor = torch.from_numpy(tensor)
+            tensor_torch = torch.from_numpy(tensor)
 
-            vad_event = vad(tensor, return_seconds=False)
+            vad_event = vad(
+                tensor_torch,
+                return_seconds=False,
+            )
+
+            now = time.monotonic()
 
             # ------------------------------------------------
-            # VAD detected speech start
+            # Speech start
             # ------------------------------------------------
 
-            if vad_event is not None and "start" in vad_event:
+            if (
+                vad_event is not None
+                and "start" in vad_event
+            ):
                 speech_active = True
 
-                # VADIterator gives sample position.
                 speech_start_time = (
                     vad_event["start"] / SAMPLE_RATE
                 )
@@ -259,26 +247,66 @@ def speech_worker():
                     flush=True,
                 )
 
-                speech_audio = []
+                speech_audio = [
+                    tensor.copy()
+                ]
 
-                # Start collecting from this point.
-                speech_audio.append(tensor.numpy())
+                last_interim_time = now
 
                 continue
 
+            # ------------------------------------------------
+            # Collect speech
+            # ------------------------------------------------
+
             if speech_active:
-                speech_audio.append(tensor.numpy())
+                speech_audio.append(
+                    tensor.copy()
+                )
 
             # ------------------------------------------------
-            # VAD detected speech end
+            # Rolling interim transcription
             # ------------------------------------------------
 
-            if vad_event is not None and "end" in vad_event:
+            if speech_active:
+                elapsed = (
+                    now - last_interim_time
+                )
+
+                total_samples = sum(
+                    len(x)
+                    for x in speech_audio
+                )
+
+                total_seconds = (
+                    total_samples / SAMPLE_RATE
+                )
+
+                if (
+                    elapsed >= INTERIM_INTERVAL
+                    and total_seconds >= INTERIM_MIN_AUDIO_SECONDS
+                ):
+                    do_interim_transcription(
+                        speech_audio,
+                        speech_start_time,
+                    )
+
+                    last_interim_time = now
+
+            # ------------------------------------------------
+            # Speech end
+            # ------------------------------------------------
+
+            if (
+                vad_event is not None
+                and "end" in vad_event
+            ):
                 if not speech_active:
                     continue
 
                 end_time = (
-                    vad_event["end"] / SAMPLE_RATE
+                    vad_event["end"]
+                    / SAMPLE_RATE
                 )
 
                 print(
@@ -304,7 +332,8 @@ def speech_worker():
 
                 speech_start_time = None
 
-                # Reset VAD state for next utterance.
+                last_interim_time = 0.0
+
                 vad.reset_states()
 
         except Exception as e:
@@ -312,6 +341,92 @@ def speech_worker():
                 f"\n[SPEECH ERROR] {e!r}",
                 flush=True,
             )
+
+
+# ============================================================
+# Interim transcription
+# ============================================================
+
+def do_interim_transcription(
+    speech_audio,
+    speech_start_time,
+):
+    try:
+        total_samples = sum(
+            len(x)
+            for x in speech_audio
+        )
+
+        window_samples = int(
+            INTERIM_WINDOW_SECONDS
+            * SAMPLE_RATE
+        )
+
+        # Don't retranscribe the whole utterance.
+        # Keep only the newest window.
+        start_sample = max(
+            0,
+            total_samples - window_samples,
+        )
+
+        chunks = []
+
+        position = 0
+
+        for chunk in speech_audio:
+            chunk_end = position + len(chunk)
+
+            if chunk_end > start_sample:
+                local_start = max(
+                    0,
+                    start_sample - position,
+                )
+
+                chunks.append(
+                    chunk[local_start:]
+                )
+
+            position = chunk_end
+
+        if not chunks:
+            return
+
+        audio = np.concatenate(chunks)
+
+        text = transcribe(audio)
+
+        if not text:
+            return
+
+        window_start = (
+            start_sample / SAMPLE_RATE
+        )
+
+        window_end = (
+            total_samples / SAMPLE_RATE
+        )
+
+        message = make_message(
+            "interim",
+            "en",
+            speech_start_time + window_start,
+            speech_start_time + window_end,
+            text,
+        )
+
+        print(
+            f"[INTERIM] {text}",
+            flush=True,
+        )
+
+        broadcast_from_thread(message)
+
+    except Exception as e:
+        print(
+            f"\n[INTERIM ERROR] {e!r}",
+            flush=True,
+        )
+
 
 # ============================================================
 # Final transcription
@@ -323,25 +438,16 @@ def do_final_transcription(
     speech_end_time,
 ):
     try:
-        text, language, start, end = transcribe(audio)
+        text = transcribe(audio)
 
         if not text:
             return
 
-        if start is None:
-            start = 0
-
-        if end is None:
-            end = len(audio) / SAMPLE_RATE
-
-        start += speech_start_time
-        end += speech_start_time
-
         message = make_message(
             "final",
-            language,
-            start,
-            end,
+            "en",
+            speech_start_time,
+            speech_end_time,
             text,
         )
 
@@ -354,7 +460,7 @@ def do_final_transcription(
 
     except Exception as e:
         print(
-            f"[FINAL ERROR] {e!r}",
+            f"\n[FINAL ERROR] {e!r}",
             flush=True,
         )
 
@@ -364,7 +470,9 @@ def do_final_transcription(
 # ============================================================
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(
+    websocket: WebSocket,
+):
     await websocket.accept()
 
     clients.add(websocket)
@@ -377,8 +485,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # Clients don't send audio.
-            # We only need to detect disconnects.
             await websocket.receive()
 
     except WebSocketDisconnect:

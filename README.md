@@ -36,6 +36,11 @@ https://docs.python.org/3/library/venv.html#how-venvs-work
 pip install -r requirements.txt
 ```
 
+### 5.1. Test whisper model
+```bash
+python gputest.py
+```
+
 ### 6.. Run the script
 ```bash
 python main.py

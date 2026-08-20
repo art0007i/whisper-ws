@@ -1,6 +1,6 @@
-faster-whisper
 sounddevice
 numpy
 fastapi
 uvicorn[standard]
 silero-vad
+soundfile
