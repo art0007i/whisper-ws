@@ -8,6 +8,12 @@ I only tested it on linux. I hope it works on windows too but it probably does n
 
 ## Usage
 
+### 0. Clone the repo
+```bash
+git clone https://github.com/art0007i/whisper-ws.git
+cd whisper-ws
+```
+
 ### 1. Compile whisper.cpp
 ```bash
 cd whisper_gpu
