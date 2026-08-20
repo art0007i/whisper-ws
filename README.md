@@ -76,3 +76,8 @@ Explanation
 - start: the time that this segment began in
 - end: the time that this segment ended in
 - text: obvious 
+
+crappy client implementation:
+```
+resdb:///fc4430bd4e5b234429ec24def142962167944f0dfded3382620a89b8509b2a43.brson
+```
