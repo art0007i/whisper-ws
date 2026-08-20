@@ -44,8 +44,11 @@ int whisper_transcribe(
     WhisperHandle * h,
     const float * audio,
     int n_samples,
+    const char * language,
     char * output,
-    int output_size
+    int output_size,
+    char * lang_out,
+    int lang_out_size
 ) {
     if (!h || !h->ctx || !audio || !output || output_size <= 0) {
         return -1;
@@ -62,7 +65,7 @@ int whisper_transcribe(
     params.translate = false;
     params.no_context = true;
 
-    params.language = "en";
+    params.language = language;
 
     // Four CPU threads for the parts that remain on CPU.
     params.n_threads = 4;
@@ -93,6 +96,12 @@ int whisper_transcribe(
         "%s",
         result.c_str()
     );
+
+    if (lang_out && lang_out_size > 0) {
+        const int lang_id = whisper_full_lang_id(h->ctx);
+        const char * lang = whisper_lang_str(lang_id);
+	if (lang) std::snprintf(lang_out, lang_out_size, "%s", lang);
+    }
 
     return 0;
 }

@@ -22,30 +22,41 @@ PORT = 6912
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-VAD_CHUNK_SAMPLES = 512
+# Silero VAD chunk.
+VAD_CHUNK_SAMPLES = 512       # 32 ms @ 16 kHz
 
+# Silence required before speech ends.
 MIN_SILENCE_MS = 600
+
+# Extra audio around speech boundaries.
 SPEECH_PAD_MS = 200
 
-# ------------------------------------------------------------
-# Rolling transcription
-# ------------------------------------------------------------
 
-# How often an interim transcription is produced.
-INTERIM_INTERVAL = 0.75
+# ============================================================
+# Rolling interim configuration
+# ============================================================
 
-# Only the newest portion of the utterance is sent to Whisper
-# for interim recognition.
-INTERIM_WINDOW_SECONDS = 4.0
+# Minimum time between interim requests.
+INTERIM_INTERVAL = 0.8
 
-# Don't attempt an interim until at least this much audio exists.
+# Only the newest portion of the utterance is used for
+# interim recognition.
+INTERIM_WINDOW_SECONDS = 2.5
+
+# Don't try to recognize extremely short audio.
 INTERIM_MIN_AUDIO_SECONDS = 0.8
 
-# ------------------------------------------------------------
+
+# ============================================================
 # Whisper
-# ------------------------------------------------------------
+# ============================================================
 
 WHISPER_MODEL = "models/ggml-base.bin"
+
+# Language code like "en" or "pl"
+# Assumes all speech is in this language.
+# Set to None to enable automatic language detection.
+WHISPER_LANGUAGE = "en"
 
 
 # ============================================================
@@ -60,18 +71,54 @@ clients = set()
 
 event_loop = None
 
+
+# ============================================================
+# Whisper job system
+# ============================================================
+
+# A request for an interim transcription.
+#
+# This is deliberately NOT a normal queue.
+#
+# There should never be a backlog of old interim jobs.
+interim_lock = threading.Lock()
+
+interim_pending = None
+
+interim_running = False
+
+
+# Final transcription has its own queue.
+#
+# There should only ever be one final job waiting.
+final_queue = queue.Queue(maxsize=1)
+
+
+# Only one Whisper call may happen at a time.
 whisper_lock = threading.Lock()
+
+
+# Used to invalidate old interim jobs.
+speech_generation = 0
+
+generation_lock = threading.Lock()
 
 
 # ============================================================
 # Load models
 # ============================================================
 
-print("Loading Whisper.cpp Vulkan GPU model...", flush=True)
+print(
+    "Loading Whisper.cpp Vulkan GPU model...",
+    flush=True,
+)
 
 whisper = WhisperGPU(WHISPER_MODEL)
 
-print("Whisper.cpp GPU model loaded.", flush=True)
+print(
+    "Whisper.cpp GPU model loaded.",
+    flush=True,
+)
 
 
 print("Loading Silero VAD...", flush=True)
@@ -110,6 +157,7 @@ async def broadcast(message):
     for client in list(clients):
         try:
             await client.send_text(message)
+
         except Exception:
             dead.append(client)
 
@@ -131,17 +179,30 @@ def broadcast_from_thread(message):
 # Microphone
 # ============================================================
 
-def microphone_callback(indata, frames, time_info, status):
+def microphone_callback(
+    indata,
+    frames,
+    time_info,
+    status,
+):
     if status:
-        print(f"\n[AUDIO] {status}", flush=True)
+        print(
+            f"\n[AUDIO] {status}",
+            flush=True,
+        )
 
+    # sounddevice reuses its input buffer,
+    # so make a copy.
     audio = indata[:, 0].copy()
 
     audio_queue.put(audio)
 
 
 def microphone_worker():
-    print("Starting microphone...", flush=True)
+    print(
+        "Starting microphone...",
+        flush=True,
+    )
 
     try:
         with sd.InputStream(
@@ -151,7 +212,10 @@ def microphone_worker():
             blocksize=VAD_CHUNK_SAMPLES,
             callback=microphone_callback,
         ):
-            print("Microphone running.", flush=True)
+            print(
+                "Microphone running.",
+                flush=True,
+            )
 
             while True:
                 time.sleep(1)
@@ -169,7 +233,10 @@ def microphone_worker():
 
 def transcribe(audio):
     """
-    Transcribe a float32 mono numpy array using whisper.cpp.
+    Run whisper.cpp on a float32 mono numpy array.
+
+    This function is thread-safe because all Whisper calls
+    are serialized through whisper_lock.
     """
 
     if len(audio) == 0:
@@ -181,15 +248,238 @@ def transcribe(audio):
     )
 
     with whisper_lock:
-        return whisper.transcribe(audio)
+        return whisper.transcribe(audio, language=WHISPER_LANGUAGE)
 
 
 # ============================================================
-# Speech processing
+# Generation handling
+# ============================================================
+
+def get_generation():
+    with generation_lock:
+        return speech_generation
+
+
+def new_generation():
+    global speech_generation
+
+    with generation_lock:
+        speech_generation += 1
+        return speech_generation
+
+
+# ============================================================
+# Interim scheduling
+# ============================================================
+
+def schedule_interim(
+    audio,
+    speech_start_time,
+    generation,
+):
+    """
+    Replace any existing pending interim.
+
+    There is intentionally only ONE pending interim.
+    """
+
+    global interim_pending
+
+    with interim_lock:
+
+        # If this speech session is already obsolete,
+        # don't schedule anything.
+        if generation != get_generation():
+            return
+
+        interim_pending = (
+            audio,
+            speech_start_time,
+            generation,
+        )
+
+
+def cancel_pending_interim():
+    """
+    Remove a pending interim.
+
+    This does NOT attempt to kill an inference that is
+    already executing. Instead, generation invalidates
+    its result.
+    """
+
+    global interim_pending
+
+    with interim_lock:
+        interim_pending = None
+
+
+# ============================================================
+# Interim worker
+# ============================================================
+
+def interim_worker():
+    """
+    Latest-only interim worker.
+
+    If Whisper is busy, newer interim requests replace
+    older pending requests rather than forming a backlog.
+    """
+
+    global interim_pending
+    global interim_running
+
+    print(
+        "Interim Whisper worker started.",
+        flush=True,
+    )
+
+    while True:
+
+        job = None
+
+        with interim_lock:
+
+            if (
+                interim_pending is not None
+                and not interim_running
+            ):
+                job = interim_pending
+                interim_pending = None
+                interim_running = True
+
+        if job is None:
+            time.sleep(0.01)
+            continue
+
+        audio, speech_start_time, generation = job
+
+        try:
+
+            # Check again before doing expensive work.
+            if generation != get_generation():
+                continue
+
+            (text, lang) = transcribe(audio)
+
+            # The speech may have ended while Whisper
+            # was processing this interim.
+            if generation != get_generation():
+                continue
+
+            if not text:
+                continue
+
+            duration = len(audio) / SAMPLE_RATE
+
+            # This is the beginning of the rolling window.
+            start_offset = max(
+                0.0,
+                duration - INTERIM_WINDOW_SECONDS,
+            )
+
+            message = make_message(
+                "interim",
+                lang,
+                speech_start_time + start_offset,
+                speech_start_time + duration,
+                text,
+            )
+
+            print(
+                f"[INTERIM] {text}",
+                flush=True,
+            )
+
+            broadcast_from_thread(message)
+
+        except Exception as e:
+
+            print(
+                f"\n[INTERIM ERROR] {e!r}",
+                flush=True,
+            )
+
+        finally:
+
+            with interim_lock:
+                interim_running = False
+
+
+# ============================================================
+# Final worker
+# ============================================================
+
+def final_worker():
+    """
+    Final transcription worker.
+
+    Final jobs have priority because the VAD worker never
+    performs Whisper inference itself.
+    """
+
+    print(
+        "Final Whisper worker started.",
+        flush=True,
+    )
+
+    while True:
+
+        job = final_queue.get()
+
+        if job is None:
+            continue
+
+        audio, speech_start_time, speech_end_time = job
+
+        try:
+
+            print(
+                "[WHISPER] Running FINAL transcription...",
+                flush=True,
+            )
+
+            (text, lang) = transcribe(audio)
+
+            if not text:
+                continue
+
+            message = make_message(
+                "final",
+                lang,
+                speech_start_time,
+                speech_end_time,
+                text,
+            )
+
+            print(
+                f"[FINAL] {text}",
+                flush=True,
+            )
+
+            broadcast_from_thread(message)
+
+        except Exception as e:
+
+            print(
+                f"\n[FINAL ERROR] {e!r}",
+                flush=True,
+            )
+
+        finally:
+
+            final_queue.task_done()
+
+
+# ============================================================
+# Speech processing / VAD
 # ============================================================
 
 def speech_worker():
-    print("Speech/VAD worker started.", flush=True)
+    print(
+        "Speech/VAD worker started.",
+        flush=True,
+    )
 
     vad = VADIterator(
         vad_model,
@@ -205,12 +495,16 @@ def speech_worker():
 
     speech_start_time = None
 
-    last_interim_time = 0.0
+    last_interim_request = 0.0
+
+    generation = 0
 
     while True:
+
         audio = audio_queue.get()
 
         try:
+
             tensor = np.asarray(
                 audio,
                 dtype=np.float32,
@@ -218,7 +512,9 @@ def speech_worker():
 
             import torch
 
-            tensor_torch = torch.from_numpy(tensor)
+            tensor_torch = torch.from_numpy(
+                tensor
+            )
 
             vad_event = vad(
                 tensor_torch,
@@ -227,19 +523,23 @@ def speech_worker():
 
             now = time.monotonic()
 
-            # ------------------------------------------------
+            # =================================================
             # Speech start
-            # ------------------------------------------------
+            # =================================================
 
             if (
                 vad_event is not None
                 and "start" in vad_event
             ):
+
                 speech_active = True
 
                 speech_start_time = (
-                    vad_event["start"] / SAMPLE_RATE
+                    vad_event["start"]
+                    / SAMPLE_RATE
                 )
+
+                generation = new_generation()
 
                 print(
                     f"\n[VAD] SPEECH START "
@@ -251,56 +551,109 @@ def speech_worker():
                     tensor.copy()
                 ]
 
-                last_interim_time = now
+                last_interim_request = now
 
                 continue
 
-            # ------------------------------------------------
-            # Collect speech
-            # ------------------------------------------------
+            # =================================================
+            # Collect audio
+            # =================================================
 
             if speech_active:
+
                 speech_audio.append(
                     tensor.copy()
                 )
 
-            # ------------------------------------------------
-            # Rolling interim transcription
-            # ------------------------------------------------
+            # =================================================
+            # Request an interim
+            # =================================================
 
             if speech_active:
+
                 elapsed = (
-                    now - last_interim_time
+                    now - last_interim_request
                 )
 
                 total_samples = sum(
-                    len(x)
-                    for x in speech_audio
+                    len(chunk)
+                    for chunk in speech_audio
                 )
 
                 total_seconds = (
-                    total_samples / SAMPLE_RATE
+                    total_samples
+                    / SAMPLE_RATE
                 )
 
                 if (
                     elapsed >= INTERIM_INTERVAL
-                    and total_seconds >= INTERIM_MIN_AUDIO_SECONDS
+                    and total_seconds
+                    >= INTERIM_MIN_AUDIO_SECONDS
                 ):
-                    do_interim_transcription(
-                        speech_audio,
-                        speech_start_time,
+
+                    # -----------------------------------------
+                    # Build rolling window.
+                    # -----------------------------------------
+
+                    window_samples = int(
+                        INTERIM_WINDOW_SECONDS
+                        * SAMPLE_RATE
                     )
 
-                    last_interim_time = now
+                    start_sample = max(
+                        0,
+                        total_samples
+                        - window_samples,
+                    )
 
-            # ------------------------------------------------
+                    chunks = []
+
+                    position = 0
+
+                    for chunk in speech_audio:
+
+                        chunk_end = (
+                            position
+                            + len(chunk)
+                        )
+
+                        if chunk_end > start_sample:
+
+                            local_start = max(
+                                0,
+                                start_sample
+                                - position,
+                            )
+
+                            chunks.append(
+                                chunk[local_start:]
+                            )
+
+                        position = chunk_end
+
+                    if chunks:
+
+                        interim_audio = np.concatenate(
+                            chunks
+                        )
+
+                        schedule_interim(
+                            interim_audio,
+                            speech_start_time,
+                            generation,
+                        )
+
+                    last_interim_request = now
+
+            # =================================================
             # Speech end
-            # ------------------------------------------------
+            # =================================================
 
             if (
                 vad_event is not None
                 and "end" in vad_event
             ):
+
                 if not speech_active:
                     continue
 
@@ -315,154 +668,81 @@ def speech_worker():
                     flush=True,
                 )
 
-                speech_active = False
+                # ---------------------------------------------
+                # Immediately invalidate every interim from
+                # this speech session.
+                # ---------------------------------------------
+
+                new_generation()
+
+                cancel_pending_interim()
+
+                # ---------------------------------------------
+                # Complete utterance.
+                # ---------------------------------------------
 
                 audio_data = np.concatenate(
                     speech_audio
                 )
 
+                # ---------------------------------------------
+                # Reset state BEFORE queueing final.
+                # ---------------------------------------------
+
+                speech_active = False
+
                 speech_audio = []
 
-                # Final transcription of the entire utterance.
-                do_final_transcription(
-                    audio_data,
-                    speech_start_time,
-                    end_time,
+                speech_start = (
+                    speech_start_time
                 )
 
                 speech_start_time = None
 
-                last_interim_time = 0.0
+                last_interim_request = 0.0
 
                 vad.reset_states()
 
+                # ---------------------------------------------
+                # Final gets priority.
+                #
+                # The queue should never contain multiple
+                # final jobs.
+                # ---------------------------------------------
+
+                try:
+
+                    # Remove an obsolete final if one somehow
+                    # remains.
+                    while True:
+                        try:
+                            final_queue.get_nowait()
+                            final_queue.task_done()
+
+                        except queue.Empty:
+                            break
+
+                    final_queue.put_nowait(
+                        (
+                            audio_data,
+                            speech_start,
+                            end_time,
+                        )
+                    )
+
+                except queue.Full:
+
+                    print(
+                        "[WHISPER] Final queue full!",
+                        flush=True,
+                    )
+
         except Exception as e:
+
             print(
                 f"\n[SPEECH ERROR] {e!r}",
                 flush=True,
             )
-
-
-# ============================================================
-# Interim transcription
-# ============================================================
-
-def do_interim_transcription(
-    speech_audio,
-    speech_start_time,
-):
-    try:
-        total_samples = sum(
-            len(x)
-            for x in speech_audio
-        )
-
-        window_samples = int(
-            INTERIM_WINDOW_SECONDS
-            * SAMPLE_RATE
-        )
-
-        # Don't retranscribe the whole utterance.
-        # Keep only the newest window.
-        start_sample = max(
-            0,
-            total_samples - window_samples,
-        )
-
-        chunks = []
-
-        position = 0
-
-        for chunk in speech_audio:
-            chunk_end = position + len(chunk)
-
-            if chunk_end > start_sample:
-                local_start = max(
-                    0,
-                    start_sample - position,
-                )
-
-                chunks.append(
-                    chunk[local_start:]
-                )
-
-            position = chunk_end
-
-        if not chunks:
-            return
-
-        audio = np.concatenate(chunks)
-
-        text = transcribe(audio)
-
-        if not text:
-            return
-
-        window_start = (
-            start_sample / SAMPLE_RATE
-        )
-
-        window_end = (
-            total_samples / SAMPLE_RATE
-        )
-
-        message = make_message(
-            "interim",
-            "en",
-            speech_start_time + window_start,
-            speech_start_time + window_end,
-            text,
-        )
-
-        print(
-            f"[INTERIM] {text}",
-            flush=True,
-        )
-
-        broadcast_from_thread(message)
-
-    except Exception as e:
-        print(
-            f"\n[INTERIM ERROR] {e!r}",
-            flush=True,
-        )
-
-
-# ============================================================
-# Final transcription
-# ============================================================
-
-def do_final_transcription(
-    audio,
-    speech_start_time,
-    speech_end_time,
-):
-    try:
-        text = transcribe(audio)
-
-        if not text:
-            return
-
-        message = make_message(
-            "final",
-            "en",
-            speech_start_time,
-            speech_end_time,
-            text,
-        )
-
-        print(
-            f"[FINAL] {text}",
-            flush=True,
-        )
-
-        broadcast_from_thread(message)
-
-    except Exception as e:
-        print(
-            f"\n[FINAL ERROR] {e!r}",
-            flush=True,
-        )
 
 
 # ============================================================
@@ -484,19 +764,26 @@ async def websocket_endpoint(
     )
 
     try:
+
         while True:
+
+            # Clients don't send audio.
+            # We only need to detect disconnects.
+
             await websocket.receive()
 
     except WebSocketDisconnect:
         pass
 
     except Exception as e:
+
         print(
             f"\n[WS ERROR] {e!r}",
             flush=True,
         )
 
     finally:
+
         clients.discard(websocket)
 
         print(
@@ -512,26 +799,49 @@ async def websocket_endpoint(
 
 @app.on_event("startup")
 async def startup():
+
     global event_loop
 
     event_loop = asyncio.get_running_loop()
 
+    # Microphone.
     threading.Thread(
         target=microphone_worker,
         daemon=True,
     ).start()
 
+    # VAD / audio processing.
     threading.Thread(
         target=speech_worker,
         daemon=True,
     ).start()
 
+    # Latest-only interim Whisper worker.
+    threading.Thread(
+        target=interim_worker,
+        daemon=True,
+    ).start()
+
+    # Final Whisper worker.
+    threading.Thread(
+        target=final_worker,
+        daemon=True,
+    ).start()
+
     print()
+
     print("=" * 60)
+
     print(
         f"WebSocket: ws://localhost:{PORT}/ws"
     )
+
+    print(
+        "Whisper backend: whisper.cpp / Vulkan"
+    )
+
     print("=" * 60)
+
     print()
 
 
@@ -540,6 +850,7 @@ async def startup():
 # ============================================================
 
 if __name__ == "__main__":
+
     uvicorn.run(
         app,
         host=HOST,

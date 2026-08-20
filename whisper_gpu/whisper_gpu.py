@@ -44,6 +44,9 @@ class WhisperGPU:
             ctypes.POINTER(ctypes.c_float),
             ctypes.c_int,
             ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
             ctypes.c_int,
         ]
         self.lib.whisper_transcribe.restype = ctypes.c_int
@@ -58,18 +61,30 @@ class WhisperGPU:
                 f"{self.model_path}"
             )
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, language=None):
         audio = audio.astype("float32", copy=False)
 
         output_size = 16384
         output = ctypes.create_string_buffer(output_size)
 
+        lang_out_size = 16
+        lang_out = ctypes.create_string_buffer(lang_out_size)
+
+        language_bytes = (
+            language.encode("utf-8")
+            if language is not None
+            else None
+        )
+
         result = self.lib.whisper_transcribe(
             self.handle,
             audio.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             len(audio),
+            language_bytes,
             output,
             output_size,
+            lang_out,
+            lang_out_size,
         )
 
         if result != 0:
@@ -77,7 +92,7 @@ class WhisperGPU:
                 f"whisper_transcribe failed with error {result}"
             )
 
-        return output.value.decode("utf-8", errors="replace").strip()
+        return (output.value.decode("utf-8", errors="replace").strip(), lang_out.value.decode("utf-8", errors="replace").strip())
 
     def __del__(self):
         handle = getattr(self, "handle", None)

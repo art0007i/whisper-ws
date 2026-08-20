@@ -49,8 +49,18 @@ python main.py
 ### 7. Connect in Resonite: `ws://127.0.0.1:6912/ws`
 It will send messages like
 ```
+type=final
 lang=en
 start=0.1
 end=1.1
 text=Hello
 ```
+
+Explanation
+- type
+    - final: gets sent when you stop talking. text seems accurate
+    - interim: gets sent in realtime, during talking. usually garbage but can be useful
+- lang: the language that whisper thinks you are speaking
+- start: the time that this segment began in
+- end: the time that this segment ended in
+- text: obvious 
