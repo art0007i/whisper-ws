@@ -1,0 +1,3 @@
+build/
+libwhisper_wrapper.so
+whisper_wrapper.dll
