@@ -1,5 +1,11 @@
 # whisper-ws
 
+lets you use speech to text in resonite (or anywhere else over a websocket)
+
+btw this is like 90% vibecoded. but the readme is at least 100% human
+
+I only tested it on linux. I hope it works on windows too but it probably does not :)
+
 ## Usage
 
 ### 1. Compile whisper.cpp
