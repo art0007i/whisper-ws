@@ -8,6 +8,12 @@ I only tested it on linux. I hope it works on windows too but it probably does n
 
 ## Usage
 
+### 0. Clone the repo
+```bash
+git clone https://github.com/art0007i/whisper-ws.git
+cd whisper-ws
+```
+
 ### 1. Compile whisper.cpp
 ```bash
 cd whisper_gpu
@@ -72,3 +78,8 @@ Explanation
 - start: the time that this segment began in
 - end: the time that this segment ended in
 - text: obvious 
+
+crappy client implementation:
+```
+resdb:///fc4430bd4e5b234429ec24def142962167944f0dfded3382620a89b8509b2a43.brson
+```
