@@ -1,0 +1,2 @@
+Silero Vad downloaded from
+https://raw.githubusercontent.com/snakers4/silero-vad/60b7ffa243625ebdc1070275a29f18c87843786a/src/silero_vad/data/silero_vad.onnx

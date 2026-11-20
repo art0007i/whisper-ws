@@ -6,7 +6,7 @@ import time
 import numpy as np
 import sounddevice as sd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from silero_vad import load_silero_vad, VADIterator
+from vad_onnx import SileroOnnxModel, VADIterator
 import uvicorn
 
 from whisper_gpu.whisper_gpu import WhisperGPU
@@ -51,7 +51,7 @@ INTERIM_MIN_AUDIO_SECONDS = 0.8
 # Whisper
 # ============================================================
 
-WHISPER_MODEL = "models/ggml-base.bin"
+WHISPER_MODEL = "models/ggml-large-v3-turbo.bin"
 
 # Language code like "en" or "pl"
 # Assumes all speech is in this language.
@@ -120,13 +120,13 @@ print(
     flush=True,
 )
 
+print("Loading Silero ONNX VAD...", flush=True)
 
-print("Loading Silero VAD...", flush=True)
-
-vad_model = load_silero_vad()
+vad_model = SileroOnnxModel(
+    "onnx/silero_vad.onnx"
+)
 
 print("VAD loaded.", flush=True)
-
 
 # ============================================================
 # WebSocket protocol
@@ -510,14 +510,8 @@ def speech_worker():
                 dtype=np.float32,
             )
 
-            import torch
-
-            tensor_torch = torch.from_numpy(
-                tensor
-            )
-
             vad_event = vad(
-                tensor_torch,
+                tensor,
                 return_seconds=False,
             )
 

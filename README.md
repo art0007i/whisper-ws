@@ -17,9 +17,9 @@ cmake --build build -j
 
 ### 2. Download whisper model
 ```bash
-./models/download-ggml-model.cmd base
+./models/download-ggml-model.cmd large-v3-turbo
 ```
-instead of 'base' you can download other models which can be better or faster or not I haven't tried them
+instead of 'large-v3-turbo' you can download other models from this list:
 - tiny
 - base
 - small
@@ -28,6 +28,8 @@ instead of 'base' you can download other models which can be better or faster or
 - large-v2
 - large-v3
 - large-v3-turbo
+
+if you choose a model different than 'large-v3-turbo' you will need to adjust main.py on the line that has `WHISPER_MODEL = `
 
 ### 3. Create venv
 ```bash
